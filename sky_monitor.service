@@ -1,0 +1,34 @@
+[Unit]
+Description=SkyMonitor ADS-B Military/Refueling Tracker
+After=network.target
+
+[Service]
+# --- EDIT THESE FIELDS ---
+# Replace 'ubuntu' with your actual username
+# Replace '/path/to/radar361' with the absolute path to the project directory
+User=ubuntu
+WorkingDirectory=/home/ubuntu/radar361
+ExecStart=/home/ubuntu/radar361/.venv/bin/python sky_monitor.py
+
+# Restart logic
+Restart=always
+RestartSec=10
+
+# Environment variables (optionally override here or use .env)
+# Environment=TELEGRAM_BOT_TOKEN=your_token
+# Environment=TELEGRAM_CHAT_ID=your_id
+
+[Install]
+WantedBy=multi-user.target
+
+# --- INSTALLATION INSTRUCTIONS ---
+# 1. Copy this file to /etc/systemd/system/:
+#    sudo cp sky_monitor.service /etc/systemd/system/
+# 2. Reload systemd:
+#    sudo systemctl daemon-reload
+# 3. Enable the service (to start on boot):
+#    sudo systemctl enable sky_monitor
+# 4. Start the service:
+#    sudo systemctl start sky_monitor
+# 5. Check logs:
+#    journalctl -u sky_monitor -f
