@@ -45,6 +45,10 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 # Region: Iran + Persian Gulf + surroundings
 REGION_BBOX = {"south": 20.0, "north": 42.0, "west": 38.0, "east": 68.0}
 
+# Endpoints Config (2026)
+CENTER_LAT, CENTER_LON = 32.0, 53.0
+RADIUS_KM = 3000  # پوشش وسیع طبق درخواست کاربر (API ممکن است محدودیت ناتیکال مایل داشته باشد)
+
 # Monitoring
 CHECK_INTERVAL_SEC = 300            # 5 minutes
 FAILURE_THRESHOLD = 3               # consecutive failures before connectivity alert
@@ -72,9 +76,9 @@ DATA_DIR = os.getenv("SKYMONITOR_DATA_DIR", "sky_monitor_data")
 SNAPSHOT_KEEP_DAYS = 7  # (simple retention; optional cleanup)
 
 # API endpoints (adsb.lol)
-ALL_URL = "https://api.adsb.lol/v2/aircraft"
+ALL_URL = f"https://api.adsb.lol/v2/point/{CENTER_LAT}/{CENTER_LON}/{RADIUS_KM}"
 MIL_URL = "https://api.adsb.lol/v2/mil"
-TANKER_URL = "https://api.adsb.lol/v2/tanker"
+# Note: TANKER_URL is no longer separate; we filter from MIL or ALL
 
 # ================== Utilities ==================
 
@@ -218,6 +222,21 @@ class ProductionSkyMonitor:
         c = callsign.strip().upper()
         return any(c.startswith(prefix) for prefix in MILITARY_CALLSIGNS)
 
+    def is_tanker(self, ac: Dict[str, Any]) -> bool:
+        """
+        Identify tankers by keywords in desc/type or military callsigns.
+        Requires 'mil' flag to be true.
+        """
+        if not ac.get("mil"):
+            return False
+        
+        desc = safe_str(ac.get("desc")).lower()
+        t = safe_str(ac.get("t")).lower()
+        flight = safe_str(ac.get("flight")).strip().upper()
+        
+        match_keywords = any(k in desc or k in t for k in ["tanker", "kc-135", "kc-46", "a330mrtt", "kc-10"])
+        return match_keywords or flight.startswith("K35R")
+
     def in_region_or_unknown(self, ac: Dict[str, Any]) -> Tuple[bool, bool]:
         """
         Returns (in_region, has_location).
@@ -262,7 +281,7 @@ class ProductionSkyMonitor:
             resp = self.session.get(url, timeout=25)
             resp.raise_for_status()
             js = resp.json()
-            aircraft = js.get("aircraft", [])
+            aircraft = js.get("ac", [])
             if not isinstance(aircraft, list):
                 aircraft = []
             dt = int((time.time() - t0) * 1000)
@@ -271,15 +290,15 @@ class ProductionSkyMonitor:
             dt = int((time.time() - t0) * 1000)
             return FetchResult(ok=False, aircraft=[], error=f"{name} fetch error: {e}", latency_ms=dt)
 
-    def get_data(self) -> Tuple[Optional[List[Dict[str, Any]]], Optional[List[Dict[str, Any]]], Optional[List[Dict[str, Any]]], Dict[str, FetchResult]]:
+    def get_data(self) -> Tuple[Optional[List[Dict[str, Any]]], Optional[List[Dict[str, Any]]], Dict[str, FetchResult]]:
         """
-        Fetch in parallel. Return (all, mil, tanker, debug_results)
-        Partial failures are allowed; we only count a cycle "failed" if all 3 fail.
+        Fetch in parallel. Return (all, mil, debug_results)
+        Simplified to only 2 endpoints.
         """
-        tasks = [("all", ALL_URL), ("mil", MIL_URL), ("tanker", TANKER_URL)]
+        tasks = [("all", ALL_URL), ("mil", MIL_URL)]
         results: Dict[str, FetchResult] = {}
 
-        with ThreadPoolExecutor(max_workers=3) as ex:
+        with ThreadPoolExecutor(max_workers=2) as ex:
             future_to_key = {ex.submit(self.fetch_url, k, u): k for (k, u) in tasks}
             for fut in as_completed(future_to_key):
                 key = future_to_key[fut]
@@ -287,26 +306,22 @@ class ProductionSkyMonitor:
 
         all_ok = results.get("all", FetchResult(False, [])).ok
         mil_ok = results.get("mil", FetchResult(False, [])).ok
-        tanker_ok = results.get("tanker", FetchResult(False, [])).ok
 
-        if not (all_ok or mil_ok or tanker_ok):
+        if not (all_ok or mil_ok):
             self.consecutive_failures += 1
             if self.consecutive_failures >= FAILURE_THRESHOLD:
                 self._alert_connectivity(results)
                 self.consecutive_failures = 0
-            return None, None, None, results
+            return None, None, results
 
-        # If at least one worked, reset failure counter
         self.consecutive_failures = 0
-
         all_ac = results["all"].aircraft if all_ok else None
         mil_ac = results["mil"].aircraft if mil_ok else None
-        tanker_ac = results["tanker"].aircraft if tanker_ok else None
-        return all_ac, mil_ac, tanker_ac, results
+        return all_ac, mil_ac, results
 
     def _alert_connectivity(self, results: Dict[str, FetchResult]) -> None:
         lines = ["<b>⚠️ API connectivity problem</b>"]
-        for k in ("all", "mil", "tanker"):
+        for k in ("all", "mil"):
             r = results.get(k)
             if not r:
                 lines.append(f"• {k}: no result")
@@ -325,16 +340,13 @@ class ProductionSkyMonitor:
     def build_interest_sets(
         self,
         all_ac: Optional[List[Dict[str, Any]]],
-        mil_ac: Optional[List[Dict[str, Any]]],
-        tanker_ac: Optional[List[Dict[str, Any]]]
+        mil_ac: Optional[List[Dict[str, Any]]]
     ) -> Dict[str, Any]:
         """
         We preserve data.
-        - mil_hex_set: from MIL endpoint + callsign heuristic (from ALL if available)
-        - tanker_hex_set: from TANKER endpoint
+        - mil_hex_set: from MIL endpoint + calls/mil from ALL
         """
         mil_hex_set = set()
-        tanker_hex_set = set()
 
         if mil_ac:
             for a in mil_ac:
@@ -342,13 +354,6 @@ class ProductionSkyMonitor:
                 if hx:
                     mil_hex_set.add(hx)
 
-        if tanker_ac:
-            for a in tanker_ac:
-                hx = self.get_hex(a)
-                if hx:
-                    tanker_hex_set.add(hx)
-
-        # Heuristic: if ALL feed shows callsign prefix military, include as military-interest
         if all_ac:
             for a in all_ac:
                 if self.is_military_callsign(a.get("flight")) or bool(a.get("mil")):
@@ -357,8 +362,7 @@ class ProductionSkyMonitor:
                         mil_hex_set.add(hx)
 
         return {
-            "mil_hex_set": mil_hex_set,
-            "tanker_hex_set": tanker_hex_set,
+            "mil_hex_set": mil_hex_set
         }
 
     def detect_enter_exit(
@@ -459,7 +463,7 @@ class ProductionSkyMonitor:
     # ---------- Main analysis cycle ----------
 
     def analyze_once(self) -> None:
-        all_ac, mil_ac, tanker_ac, debug = self.get_data()
+        all_ac, mil_ac, debug = self.get_data()
 
         # Store raw snapshots (even if partial)
         self.store.append("snapshots", {
@@ -472,25 +476,21 @@ class ProductionSkyMonitor:
             "counts": {
                 "all": len(all_ac) if all_ac is not None else None,
                 "mil": len(mil_ac) if mil_ac is not None else None,
-                "tanker": len(tanker_ac) if tanker_ac is not None else None,
             },
-            # Keep raw lists as-is (they can be large; if too big, we can switch to storing only region subset)
+            # Keep raw lists as-is
             "all_aircraft": all_ac if all_ac is not None else None,
             "mil_aircraft": mil_ac if mil_ac is not None else None,
-            "tanker_aircraft": tanker_ac if tanker_ac is not None else None,
         })
 
-        # Build interest sets (mil/tanker hex sets)
-        interest = self.build_interest_sets(all_ac, mil_ac, tanker_ac)
+        # Build interest sets (mil hex sets)
+        interest = self.build_interest_sets(all_ac, mil_ac)
         mil_hex_set = interest["mil_hex_set"]
-        tanker_hex_set = interest["tanker_hex_set"]
 
         # Build region subsets (for operational signals)
         flights_in_region: List[Dict[str, Any]] = []
         military_in_region: List[Dict[str, Any]] = []
-        tankers_in_region: List[Dict[str, Any]] = []
 
-        # From ALL: we can count commercial + also catch military-looking flights
+        # From ALL: we catch military-looking flights + tankers
         if all_ac:
             for ac in all_ac:
                 in_reg, has_loc = self.in_region_or_unknown(ac)
@@ -500,29 +500,19 @@ class ProductionSkyMonitor:
 
                 hx = self.get_hex(ac)
                 is_mil = (hx in mil_hex_set) or bool(ac.get("mil")) or self.is_military_callsign(ac.get("flight"))
-                is_tanker = (hx in tanker_hex_set)
 
-                # Preserve and classify for signals (even if not airborne; operations can start on ground)
+                # Preserve and classify
                 if is_mil:
                     military_in_region.append(ac)
-                if is_tanker:
-                    tankers_in_region.append(ac)
 
-        # From MIL endpoint: add anything in region (even if ALL feed missing)
+        # From MIL endpoint
         if mil_ac:
             for ac in mil_ac:
                 in_reg, has_loc = self.in_region_or_unknown(ac)
                 if in_reg:
                     military_in_region.append(ac)
 
-        # From TANKER endpoint
-        if tanker_ac:
-            for ac in tanker_ac:
-                in_reg, has_loc = self.in_region_or_unknown(ac)
-                if in_reg:
-                    tankers_in_region.append(ac)
-
-        # Deduplicate by hex (keep last occurrence)
+        # Deduplicate
         def dedup_by_hex(lst: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
             m: Dict[str, Dict[str, Any]] = {}
             for a in lst:
@@ -532,7 +522,9 @@ class ProductionSkyMonitor:
             return m
 
         mil_map = dedup_by_hex(military_in_region)
-        tanker_map = dedup_by_hex(tankers_in_region)
+        
+        # New Tanker Filter logic: filter from deduplicated military map
+        tanker_map = {hx: ac for hx, ac in mil_map.items() if self.is_tanker(ac)}
 
         # Enter/Exit detection (military + tankers)
         new_mil, gone_mil = self.detect_enter_exit(mil_map, self.active_military)
@@ -546,8 +538,8 @@ class ProductionSkyMonitor:
             for ac in flights_in_region:
                 hx = self.get_hex(ac)
                 is_mil = (hx in mil_hex_set) or bool(ac.get("mil")) or self.is_military_callsign(ac.get("flight"))
-                is_tanker = (hx in tanker_hex_set)
-                if not is_mil and not is_tanker:
+                is_tank = self.is_tanker(ac)
+                if not is_mil and not is_tank:
                     # For traffic volume, typically airborne; but keep option:
                     if self.is_airborne(ac):
                         commercial.append(ac)
