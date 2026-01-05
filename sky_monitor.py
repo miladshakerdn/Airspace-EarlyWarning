@@ -73,7 +73,7 @@ TELEGRAM_MAX_CHARS = 3500
 
 # Persistence (raw snapshots + events)
 DATA_DIR = os.getenv("SKYMONITOR_DATA_DIR", "sky_monitor_data")
-SNAPSHOT_KEEP_DAYS = 7  # (simple retention; optional cleanup)
+SNAPSHOT_KEEP_DAYS = 2  # (simple retention; optional cleanup)
 
 # API endpoints (adsb.lol)
 ALL_URL = f"https://api.adsb.lol/v2/point/{CENTER_LAT}/{CENTER_LON}/{RADIUS_KM}"
@@ -135,6 +135,28 @@ class JsonlStore:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as e:
             logging.error(f"Failed writing {path}: {e}")
+
+    def purge_old(self, keep_days: int) -> None:
+        """Removes files older than keep_days based on the date in the filename."""
+        try:
+            now = datetime.now(timezone.utc)
+            for filename in os.listdir(self.base_dir):
+                if not filename.endswith(".jsonl"):
+                    continue
+                # Filename pattern: name-YYYY-MM-DD.jsonl
+                parts = filename.rsplit("-", 3)
+                if len(parts) < 2:
+                    continue
+                date_str = parts[-3] + "-" + parts[-2] + "-" + parts[-1].replace(".jsonl", "")
+                try:
+                    file_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    if (now - file_date).days >= keep_days:
+                        os.remove(os.path.join(self.base_dir, filename))
+                        logging.info(f"Purged old data file: {filename}")
+                except ValueError:
+                    continue
+        except Exception as e:
+            logging.error(f"Error during data purge: {e}")
 
 # ================== Telegram ==================
 
@@ -465,7 +487,21 @@ class ProductionSkyMonitor:
     def analyze_once(self) -> None:
         all_ac, mil_ac, debug = self.get_data()
 
-        # Store raw snapshots (even if partial)
+        # Build interest sets (mil hex sets)
+        interest = self.build_interest_sets(all_ac, mil_ac)
+        mil_hex_set = interest["mil_hex_set"]
+
+        # Optimize snapshots: only store "interesting" aircraft to save space.
+        # Interesting = military, tanker, or within our target region (Iran/Gulf).
+        filtered_all = []
+        if all_ac:
+            for ac in all_ac:
+                hx = self.get_hex(ac)
+                is_mil = (hx in mil_hex_set) or bool(ac.get("mil")) or self.is_military_callsign(ac.get("flight"))
+                in_reg, _ = self.in_region_or_unknown(ac)
+                if is_mil or in_reg:
+                    filtered_all.append(ac)
+
         self.store.append("snapshots", {
             "ts": utc_iso(),
             "region_bbox": REGION_BBOX,
@@ -474,17 +510,12 @@ class ProductionSkyMonitor:
                 for k, v in debug.items()
             },
             "counts": {
-                "all": len(all_ac) if all_ac is not None else None,
-                "mil": len(mil_ac) if mil_ac is not None else None,
+                "all_raw": len(all_ac) if all_ac is not None else None,
+                "all_stored": len(filtered_all),
+                "mil_raw": len(mil_ac) if mil_ac is not None else None,
             },
-            # Keep raw lists as-is
-            "all_aircraft": all_ac if all_ac is not None else None,
-            "mil_aircraft": mil_ac if mil_ac is not None else None,
+            "aircraft": filtered_all,
         })
-
-        # Build interest sets (mil hex sets)
-        interest = self.build_interest_sets(all_ac, mil_ac)
-        mil_hex_set = interest["mil_hex_set"]
 
         # Build region subsets (for operational signals)
         flights_in_region: List[Dict[str, Any]] = []
@@ -680,6 +711,10 @@ def main():
     )
 
     ensure_dir(DATA_DIR)
+    
+    # Run initial cleanup
+    store = JsonlStore(DATA_DIR)
+    store.purge_old(SNAPSHOT_KEEP_DAYS)
 
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)

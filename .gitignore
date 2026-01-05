@@ -1,3 +1,4 @@
 .env
 *.log
 sky_monitor_data
+__pycache__
