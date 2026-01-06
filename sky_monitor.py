@@ -493,7 +493,7 @@ class ProductionSkyMonitor:
 
                     t_call = html_escape(self.flight_id(t))
                     m_call = html_escape(self.flight_id(m))
-                    adsb_link = f"https://globe.adsb.lol/?hex={t_hex}"
+                    adsb_link = f"https://globe.adsb.lol/?icao={t_hex}"
                     gmap_link = f"https://www.google.com/maps?q={t_lat},{t_lon}"
 
                     events.append(
