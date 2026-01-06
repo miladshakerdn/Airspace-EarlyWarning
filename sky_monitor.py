@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -48,6 +49,21 @@ REGION_BBOX = {"south": 20.0, "north": 42.0, "west": 38.0, "east": 68.0}
 # Endpoints Config (2026)
 CENTER_LAT, CENTER_LON = 32.0, 53.0
 RADIUS_KM = 3000  # پوشش وسیع طبق درخواست کاربر (API ممکن است محدودیت ناتیکال مایل داشته باشد)
+
+# Feature Toggles (env vars – 1 = enabled)
+ZSCORE_ENABLED = os.getenv("ZSCORE_ENABLED", "0") == "1"
+CORRIDOR_ENABLED = os.getenv("CORRIDOR_ENABLED", "0") == "1"
+
+# Z-Score Config
+ZSCORE_THRESHOLD = float(os.getenv("ZSCORE_THRESHOLD", "2.5"))  # |Z| > this → alert
+ZSCORE_MIN_SAMPLES = int(os.getenv("ZSCORE_MIN_SAMPLES", "20"))
+
+# Corridors (strategic paths – edit as needed)
+CORRIDORS = [
+    {"name": "Persian Gulf Tanker Route", "south": 24.0, "north": 27.0, "west": 50.0, "east": 56.0},
+    {"name": "Strait of Hormuz Approach", "south": 25.0, "north": 27.5, "west": 55.0, "east": 57.0},
+    {"name": "Turkey-Iran Transit", "south": 36.0, "north": 40.0, "west": 40.0, "east": 48.0},
+]
 
 # Monitoring
 CHECK_INTERVAL_SEC = 300            # 5 minutes
@@ -223,6 +239,20 @@ class ProductionSkyMonitor:
         self.tg = TelegramClient(self.session, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         self.store = JsonlStore(DATA_DIR)
 
+        # Z-Score histories
+        if ZSCORE_ENABLED:
+            self.zscore_histories = {
+                "commercial": deque(maxlen=50),
+                "tanker": deque(maxlen=50),
+                "military": deque(maxlen=50),
+            }
+            if CORRIDOR_ENABLED:
+                self.corridor_z_histories = {corr["name"]: deque(maxlen=50) for corr in CORRIDORS}
+
+        # Corridor counts
+        if CORRIDOR_ENABLED:
+            self.corridor_counts = {corr["name"]: 0 for corr in CORRIDORS}
+
         self.commercial_history = deque(maxlen=MOVING_AVG_WINDOW)
         self.last_commercial_alert_ts = 0.0
         self.consecutive_failures = 0
@@ -258,6 +288,14 @@ class ProductionSkyMonitor:
         
         match_keywords = any(k in desc or k in t for k in ["tanker", "kc-135", "kc-46", "a330mrtt", "kc-10"])
         return match_keywords or flight.startswith("K35R")
+
+    def in_corridor(self, ac: Dict[str, Any], corridor: Dict[str, float]) -> bool:
+        lat = safe_float(ac.get("lat"))
+        lon = safe_float(ac.get("lon"))
+        if lat is None or lon is None:
+            return False
+        return (corridor["south"] <= lat <= corridor["north"] and
+                corridor["west"] <= lon <= corridor["east"])
 
     def in_region_or_unknown(self, ac: Dict[str, Any]) -> Tuple[bool, bool]:
         """
@@ -601,6 +639,81 @@ class ProductionSkyMonitor:
                             "drop_pct": drop_pct,
                         })
 
+        # ----- Z-Score Extension -----
+        z_alerts = []
+        if ZSCORE_ENABLED:
+            # Update histories
+            self.zscore_histories["commercial"].append(commercial_count or 0)
+            self.zscore_histories["tanker"].append(len(tanker_map))
+            self.zscore_histories["military"].append(len(mil_map))
+            
+            for cat, hist in self.zscore_histories.items():
+                if len(hist) >= ZSCORE_MIN_SAMPLES:
+                    arr = np.array(hist)
+                    mean = np.mean(arr)
+                    std = np.std(arr)
+                    if std == 0: std = 1
+                    current = arr[-1]
+                    z = (current - mean) / std
+                    if abs(z) > ZSCORE_THRESHOLD:
+                        direction = "Spike 🔥" if z > 0 else "Drop 📉"
+                        z_alerts.append(
+                            f"<b>Z-Score Alert {direction}</b>\n"
+                            f"• {cat.capitalize()}: Z = <b>{z:.2f}</b>\n"
+                            f"• Current: <b>{int(current)}</b> | Mean: <b>{mean:.1f}</b>"
+                        )
+                        self.store.append("events", {
+                            "ts": utc_iso(),
+                            "type": "zscore_anomaly",
+                            "category": cat,
+                            "z": z,
+                            "current": int(current),
+                            "mean": mean,
+                        })
+
+        # ----- Corridor Extension -----
+        corridor_alerts = []
+        if CORRIDOR_ENABLED:
+            # Reset counts
+            for name in self.corridor_counts:
+                self.corridor_counts[name] = 0
+            
+            # Count airborne in each corridor (commercial + mil/tanker)
+            for ac in flights_in_region:
+                if not self.is_airborne(ac):
+                    continue
+                for corr in CORRIDORS:
+                    if self.in_corridor(ac, corr):
+                        self.corridor_counts[corr["name"]] += 1
+
+            # Update histories and Calculate Z-Score per corridor
+            for corr in CORRIDORS:
+                name = corr["name"]
+                count = self.corridor_counts[name]
+                hist = self.corridor_z_histories[name]
+                hist.append(count)
+                
+                if len(hist) >= ZSCORE_MIN_SAMPLES:
+                    arr = np.array(hist)
+                    mean = np.mean(arr)
+                    std = np.std(arr)
+                    if std == 0: std = 1
+                    z = (count - mean) / std
+                    if abs(z) > ZSCORE_THRESHOLD:
+                        direction = "Activity Spike 🍒" if z > 0 else "Clearance 📉"
+                        corridor_alerts.append(
+                            f"<b>Corridor Alert: {name}</b>\n"
+                            f"• {direction} Z = <b>{z:.2f}</b>\n"
+                            f"• Count: <b>{count}</b>"
+                        )
+                        self.store.append("events", {
+                            "ts": utc_iso(),
+                            "type": "corridor_anomaly",
+                            "corridor": name,
+                            "z": z,
+                            "count": count,
+                        })
+
         # Refueling (airborne-only for calculation)
         tankers_airborne = [a for a in tanker_map.values() if self.is_airborne(a)]
         mil_airborne = [a for a in mil_map.values() if self.is_airborne(a)]
@@ -620,6 +733,19 @@ class ProductionSkyMonitor:
         if drop_alert_text:
             msg_lines.append("")
             msg_lines.append(drop_alert_text)
+
+        if z_alerts:
+            msg_lines.append("")
+            msg_lines.extend(z_alerts)
+        
+        if corridor_alerts:
+            msg_lines.append("")
+            msg_lines.append("<b>🔥 Corridor Hotspots</b>")
+            msg_lines.extend(corridor_alerts)
+            # Summary counts
+            msg_lines.append("\n<b>Corridor Counts</b>")
+            for name, count in self.corridor_counts.items():
+                msg_lines.append(f"• {name}: <b>{count}</b> airborne")
 
         # New / gone tankers
         if new_tank:
